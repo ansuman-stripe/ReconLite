@@ -1,6 +1,6 @@
 # Importing required packages
 import os
-from autohubble import hubble_query_to_df_and_permalink, PRESTO
+from autohubble import hubble_query_to_df_and_permalink,hubble_query_to_df, PRESTO
 import pandas as pd
 import numpy as np
 import csv
@@ -75,205 +75,267 @@ main_data = pd.read_csv(main_csv_path, dtype=str)
 
 ################################################################################################ Creating master data table for processing
 # Hubble query to pull incident pbats
-sql_pbat_data = f'''
-with pbat_cte as (
-    select p.Date,_id as pbat, bank_Account_transaction, p.amount / 100.00 as amount, p.description as pdescription, i.description as idescription, cast(regexp_extract(p.description, 'WT ([0-9]+)', 1) as varchar) as ref, i.ibat
-  from mongo.parsedbankaccounttransactions p
-  join ( 
-    select _id as ibat,date, amount, account, description 
-    from mongo.intradaybankaccounttransactions where description like '%BNF=STRIPE%'
-  ) as i on i.description like concat('%', regexp_extract(p.description, 'WT ([0-9]+)', 1), '%')
-  where 1=1
-  and reconciliation_key is null
-  and length(regexp_extract(p.description, 'WT ([0-9]+)', 1)) = 16
-  and label = 'wells_ach_perfect_receivable'
-  and currency = 'usd'
-  order by date desc
-  set session default_locale_only=true
-), jira_cte as (
-  select issue_link,description as jdescription from jiradb.denormalized_jiraissue
-  where 1=1
-  and project_id = 42801
-  and (labels like '%ach-perfectreceivable%' and labels like '%sdc-techops-bulk-clearing%' and labels like '%sdc-techops-projects%' and labels like '%sdc-ui-clearing%')
-) select Date, pbat, bank_Account_transaction, amount, pdescription, idescription, ref, ibat, issue_link 
-from pbat_cte left join jira_cte on jdescription like concat('%',pbat,'%')
-where issue_link is null
-'''
-permalink_pbat_data, df_pbat_data = hubble_query_to_df_and_permalink(sql_pbat_data, PRESTO)
+try:
+    sql_pbat_data = '''
+    with pbat_cte as (
+        select p.Date,_id as pbat, bank_Account_transaction, p.amount / 100.00 as amount, p.description as pdescription, i.description as idescription, cast(regexp_extract(p.description, 'WT ([0-9]+)', 1) as varchar) as ref, i.ibat
+      from mongo.parsedbankaccounttransactions p
+      join ( 
+        select _id as ibat,date, amount, account, description 
+        from mongo.intradaybankaccounttransactions where description like '%BNF=STRIPE%'
+      ) as i on i.description like concat('%', regexp_extract(p.description, 'WT ([0-9]+)', 1), '%')
+      where 1=1
+      and reconciliation_key is null
+      and length(regexp_extract(p.description, 'WT ([0-9]+)', 1)) = 16
+      and label = 'wells_ach_perfect_receivable'
+      and currency = 'usd'
+      order by date desc
+      set session default_locale_only=true
+    ), jira_cte as (
+      select issue_link,description as jdescription from jiradb.denormalized_jiraissue
+      where 1=1
+      and project_id = 42801
+      and (labels like '%ach-perfectreceivable%' and labels like '%sdc-techops-bulk-clearing%' and labels like '%sdc-techops-projects%' and labels like '%sdc-ui-clearing%')
+    ) select Date, pbat, bank_Account_transaction, amount, pdescription, idescription, ref, ibat, issue_link 
+    from pbat_cte left join jira_cte on jdescription like concat('%',pbat,'%')
+    where issue_link is null
+    '''
+    df_pbat_data = hubble_query_to_df(sql_pbat_data, PRESTO)
+    # permalink_pbat_data, df_pbat_data = hubble_query_to_df_and_permalink(sql_pbat_data, PRESTO)
+    print(df_pbat_data)
 
-# Perform a left join on 'Msg Dr Sbk Ref Num' from main_data with 'ref' in df_pbat_data
-merged_vban_data = pd.merge(df_pbat_data.astype(str),
-    combined_data.astype(str).rename(columns={'Msg Dr Sbk Ref Num': 'ref'}),  # Rename for join consistency
-    on='ref',how='left')
+    # Check if df_pbat_data is empty
+    if df_pbat_data.empty:
+        print("No unreconciled PBATs found. All cases are already handled.")
+        # Exit or handle the empty case appropriately
+        raise SystemExit("Script completed: No cases to process.")
 
-# Rename 'WPIC Account' column to 'vban' and filling null values
-merged_vban_data.rename(columns={'WPIC Account': 'VBAN'}, inplace=True)
-merged_vban_data['VBAN']= merged_vban_data['VBAN'].fillna('VBAN Not provided by WF')
+    # Perform a left join on 'Msg Dr Sbk Ref Num' from main_data with 'ref' in df_pbat_data
+    merged_vban_data = pd.merge(df_pbat_data.astype(str),
+        combined_data.astype(str).rename(columns={'Msg Dr Sbk Ref Num': 'ref'}),  # Rename for join consistency
+        on='ref',how='left')
 
-# Pulling valid vbans to get account and cu object
-valid_vbans = merged_vban_data[merged_vban_data['VBAN'] != 'VBAN Not provided by WF']['VBAN'].values
-vbans_output = '|'.join(valid_vbans)
+    # Rename 'WPIC Account' column to 'vban' and filling null values
+    merged_vban_data.rename(columns={'WPIC Account': 'VBAN'}, inplace=True)
+    merged_vban_data['VBAN']= merged_vban_data['VBAN'].fillna('VBAN Not provided by WF')
 
-sql_cu_data = f'''
- WITH base AS (
-  select
-    vban.state AS vban_state,
-    vban.type,
-  concat_ws(
-      '::',
-      vban.vban.ach.account_number,
-      vban.vban.indonesia_ct.account_number,
-      vban.vban.japan_bt.account_number,
-      vban.vban.sepa.account_number,
-      vban.vban.sepa.iban,
-      vban.vban.spei.clabe,
-      vban.vban.uk_ct.account_number
-    ) AS account_number,
-    vamv.funding_flow.destination_customer_balance.customer,
-    vamv.merchant,
-    from_unixtime(vamv.obj_attr.c_time.millis / 1000) AS vban_allocated_on,
-    vban.id AS vr_id,
-    vnmv.id AS vnm_id
-  from
-    iceberg.vbandb.vban_record vban
-    left join iceberg.h_merchant_banktransfersfpi.sharded_vban_network_model_records vnmv ON vban.external_id = vnmv.id
-    left join iceberg.h_merchant_banktransfersfpi.sharded_vban_allocation_model_records vamv ON vnmv.vban_allocation_id = vamv.id
-)
-select
-  account_number,customer,merchant
-from
-  base b
-where 1=1
-and type = 'WELLS_FARGO_USD'
-and vban_state = 'ALLOCATED'
-and regexp_like(account_number, '{vbans_output}')
-'''
-permalink_cu_data, df_cu_data = hubble_query_to_df_and_permalink(sql_cu_data, PRESTO)
+    # Pulling valid vbans to get account and cu object
+    valid_vbans = merged_vban_data[merged_vban_data['VBAN'] != 'VBAN Not provided by WF']['VBAN'].values
+    vbans_output = '|'.join(valid_vbans)
+    
+    # Check if there are any valid VBANs
+    if not valid_vbans.size:
+        print("No valid VBANs found. All entries are missing VBAN information.")
+        # Create basic output files with the data we have
+        merged_csv_path = os.path.join(script_directory, 'merged_data.csv')
+        merged_vban_data.to_csv(merged_csv_path, index=False)
+        print(f"\nMerged data saved to {merged_csv_path}")
+        
+        # All cases would be exceptions
+        exceptionCases_csv_path = os.path.join(script_directory, 'exceptionCases_data.csv')
+        merged_vban_data.to_csv(exceptionCases_csv_path, index=False)
+        print(f"\nAll cases are exceptions, data saved to {exceptionCases_csv_path}")
+        
+        # Exit or handle appropriately
+        raise SystemExit("Script completed: No valid VBANs to process.")
 
-# Perform a left join on 'VBAN' from merged_vban_data with 'account_number' in df_cu_data
-merged_cu_data = pd.merge(merged_vban_data.astype(str),
-    df_cu_data.astype(str).rename(columns={'account_number': 'VBAN','customer': 'cu_src_object' }),  # Rename for join consistency
-    on='VBAN',how='left')
+    sql_cu_data = f'''
+     WITH base AS (
+      select
+        vban.state AS vban_state,
+        vban.type,
+      concat_ws(
+          '::',
+          vban.vban.ach.account_number,
+          vban.vban.indonesia_ct.account_number,
+          vban.vban.japan_bt.account_number,
+          vban.vban.sepa.account_number,
+          vban.vban.sepa.iban,
+          vban.vban.spei.clabe,
+          vban.vban.uk_ct.account_number
+        ) AS account_number,
+        vamv.funding_flow.destination_customer_balance.customer,
+        vamv.merchant,
+        from_unixtime(vamv.obj_attr.c_time.millis / 1000) AS vban_allocated_on,
+        vban.id AS vr_id,
+        vnmv.id AS vnm_id
+      from
+        iceberg.vbandb.vban_record vban
+        left join iceberg.h_merchant_banktransfersfpi.sharded_vban_network_model_records vnmv ON vban.external_id = vnmv.id
+        left join iceberg.h_merchant_banktransfersfpi.sharded_vban_allocation_model_records vamv ON vnmv.vban_allocation_id = vamv.id
+    )
+    select
+      account_number,customer,merchant
+    from
+      base b
+    where 1=1
+    and type = 'WELLS_FARGO_USD'
+    and vban_state = 'ALLOCATED'
+    and regexp_like(account_number, '{vbans_output}')
+    '''
+    df_cu_data = hubble_query_to_df(sql_cu_data, PRESTO)
+    # permalink_cu_data, df_cu_data = hubble_query_to_df_and_permalink(sql_cu_data, PRESTO)
 
-# Pulling valid vbans to get account and src object
-filtered_vbans = merged_cu_data[(merged_cu_data['cu_src_object'].isnull()) &(merged_cu_data['merchant'].isnull()) &(merged_cu_data['VBAN'] != 'VBAN Not provided by WF')]['VBAN'].values
-vbans_output = ','.join(f"'{vban}'" for vban in filtered_vbans)
+    # Perform a left join on 'VBAN' from merged_vban_data with 'account_number' in df_cu_data
+    merged_cu_data = pd.merge(merged_vban_data.astype(str),
+        df_cu_data.astype(str).rename(columns={'account_number': 'VBAN','customer': 'cu_src_object' }),  # Rename for join consistency
+        on='VBAN',how='left')
 
-sql_src_data = f'''
-select _id as cu_src_object,merchant,cast(json_extract(external_data, '$.account_number') AS varchar) as VBAN,status as src_status
-from mongo.sources
-where 1=1
-and cast(json_extract(external_data, '$.account_number') AS varchar) in ({vbans_output}) 
-'''
-permalink_src_data, df_src_data = hubble_query_to_df_and_permalink(sql_src_data, PRESTO)
+    # Pulling valid vbans to get account and src object
+    filtered_vbans = merged_cu_data[(merged_cu_data['cu_src_object'].isnull()) &(merged_cu_data['merchant'].isnull()) &(merged_cu_data['VBAN'] != 'VBAN Not provided by WF')]['VBAN'].values
+    vbans_output = ','.join(f"'{vban}'" for vban in filtered_vbans)
 
-# Perform a left join on 'VBAN' from merged_cu_data with 'account_number' in sql_src_data
-merged_final_data = pd.merge(merged_cu_data.astype(str),df_src_data.astype(str),on='VBAN',how='left')
+    # Continue only if there are vbans to look for in sources
+    if filtered_vbans.size:
+        sql_src_data = f'''
+        select _id as cu_src_object,merchant,cast(json_extract(external_data, '$.account_number') AS varchar) as VBAN,status as src_status
+        from mongo.sources
+        where 1=1
+        and cast(json_extract(external_data, '$.account_number') AS varchar) in ({vbans_output}) 
+        '''
+        df_src_data = hubble_query_to_df(sql_src_data, PRESTO)
+        # permalink_src_data, df_src_data = hubble_query_to_df_and_permalink(sql_src_data, PRESTO)
+    else:
+        # Create an empty DataFrame with the correct columns if no VBANs need source lookup
+        df_src_data = pd.DataFrame(columns=['cu_src_object', 'merchant', 'VBAN', 'src_status'])
 
-merged_final_data['cu_src_object'] = np.where(
-    merged_final_data['cu_src_object_y'].notnull(),merged_final_data['cu_src_object_y'],merged_final_data['cu_src_object_x'])
-merged_final_data['merchant'] = np.where(
-    merged_final_data['merchant_y'].notnull(),merged_final_data['merchant_y'],merged_final_data['merchant_x'])
-merged_final_data.drop(columns=['cu_src_object_x', 'cu_src_object_y', 'merchant_x', 'merchant_y'], inplace=True)
+    # Perform a left join on 'VBAN' from merged_cu_data with 'account_number' in sql_src_data
+    merged_final_data = pd.merge(merged_cu_data.astype(str),df_src_data.astype(str),on='VBAN',how='left')
 
-merged_final_data['src_status'] = np.where(
-    (merged_final_data['cu_src_object'].str.startswith('cu_')) & 
-    (merged_final_data['VBAN'] != 'VBAN Not provided by WF'),
-    'Horizon',
-    merged_final_data['src_status']  # Leave original status (which might be NaN) untouched otherwise
-)
+    merged_final_data['cu_src_object'] = np.where(
+        merged_final_data['cu_src_object_y'].notnull(),merged_final_data['cu_src_object_y'],merged_final_data['cu_src_object_x'])
+    merged_final_data['merchant'] = np.where(
+        merged_final_data['merchant_y'].notnull(),merged_final_data['merchant_y'],merged_final_data['merchant_x'])
+    merged_final_data.drop(columns=['cu_src_object_x', 'cu_src_object_y', 'merchant_x', 'merchant_y'], inplace=True)
 
-merged_final_data['merchant'] = merged_final_data['merchant'].replace('nan', np.nan)
-valid_acct = merged_final_data[merged_final_data['merchant'].notnull()]['merchant'].values
-acct_output = ','.join(f"'{acct}'" for acct in valid_acct)
+    merged_final_data['src_status'] = np.where(
+        (merged_final_data['cu_src_object'].str.startswith('cu_')) & 
+        (merged_final_data['VBAN'] != 'VBAN Not provided by WF'),
+        'Horizon',
+        merged_final_data['src_status']  # Leave original status (which might be NaN) untouched otherwise
+    )
 
-sql_acct_data = f'''
-select merchant_id as merchant,account_applications__latest__application_state as merchant_status,is_rejected,is_deleted from cdm.merchants_core
-where 1=1
-and merchant_id in ({acct_output})
-'''
-permalink_acct_data, df_acct_data = hubble_query_to_df_and_permalink(sql_acct_data, PRESTO)
+    merged_final_data['merchant'] = merged_final_data['merchant'].replace('nan', np.nan)
+    valid_acct = merged_final_data[merged_final_data['merchant'].notnull()]['merchant'].values
+    
+    # Create merchant query only if there are merchants to query
+    if valid_acct.size:
+        acct_output = ','.join(f"'{acct}'" for acct in valid_acct)
+        sql_acct_data = f'''
+        select merchant_id as merchant,account_applications__latest__application_state as merchant_status,is_rejected,is_deleted from cdm.merchants_core
+        where 1=1
+        and merchant_id in ({acct_output})
+        '''
+        df_acct_data = hubble_query_to_df(sql_acct_data, PRESTO)
+        # permalink_acct_data, df_acct_data = hubble_query_to_df_and_permalink(sql_acct_data, PRESTO)
+    else:
+        # Create an empty DataFrame with the correct columns if no merchants to query
+        df_acct_data = pd.DataFrame(columns=['merchant', 'merchant_status', 'is_rejected', 'is_deleted'])
 
-# Perform a left join on 'VBAN' from merged_cu_data with 'account_number' in sql_src_data
-merged_master_data = pd.merge(merged_final_data.astype(str),df_acct_data.astype(str),on='merchant',how='left')
+    # Perform a left join on 'VBAN' from merged_cu_data with 'account_number' in sql_src_data
+    merged_master_data = pd.merge(merged_final_data.astype(str),df_acct_data.astype(str),on='merchant',how='left')
 
-# Save the merged data with the required columns
-merged_csv_path = os.path.join(script_directory, 'merged_data.csv')
-merged_master_data.to_csv(merged_csv_path, index=False)
-print(f"\nMerged data saved to {merged_csv_path}")
+    # Save the merged data with the required columns
+    merged_csv_path = os.path.join(script_directory, 'merged_data.csv')
+    merged_master_data.to_csv(merged_csv_path, index=False)
+    print(f"\nMerged data saved to {merged_csv_path}")
 
-################################################################################################ Segregating data as per processing rails
-# Data for Generate Synthtic IBAT
-filtered_data_for_cu_excelsior = merged_master_data[
-    (merged_master_data['src_status'] == 'Horizon') & 
-    (merged_master_data['merchant_status'] != 'rejected') & 
-    (merged_master_data['is_deleted'] == 'False') & 
-    (merged_master_data['is_rejected'] == 'False')
-]
+    ################################################################################################ Segregating data as per processing rails
+    # Data for Generate Synthtic IBAT
+    filtered_data_for_cu_excelsior = merged_master_data[
+        (merged_master_data['src_status'] == 'Horizon') & 
+        (merged_master_data['merchant_status'] != 'rejected') & 
+        (merged_master_data['is_deleted'] == 'False') & 
+        (merged_master_data['is_rejected'] == 'False')
+    ]
 
-# Exclusion: Remove rows from merged_master_data for next operation
-merged_master_data = merged_master_data[~merged_master_data.index.isin(filtered_data_for_cu_excelsior.index)]
+    # Check if any data was filtered for Generate Synthetic IBAT
+    if filtered_data_for_cu_excelsior.empty:
+        print("No records found for Generate Synthetic IBAT")
 
-# Data for Manually Update Wire description
-filtered_data_for_src_excelsior = merged_master_data[
-    ((merged_master_data['src_status'] == 'pending') | (merged_master_data['src_status'] == 'chargeable') ) & 
-    (merged_master_data['merchant_status'] != 'rejected') & 
-    (merged_master_data['is_deleted'] == 'False') & 
-    (merged_master_data['is_rejected'] == 'False')
-]
+    # Create a new DataFrame for storing remaining records after removing processed ones
+    remaining_master_data = merged_master_data[~merged_master_data.index.isin(filtered_data_for_cu_excelsior.index)]
 
-# Data to upload to Jira duing creation
-jira_upload_data = pd.concat([filtered_data_for_cu_excelsior, filtered_data_for_src_excelsior])
+    # Data for Manually Update Wire description
+    filtered_data_for_src_excelsior = remaining_master_data[
+        ((remaining_master_data['src_status'] == 'pending') | (remaining_master_data['src_status'] == 'chargeable') ) & 
+        (remaining_master_data['merchant_status'] != 'rejected') & 
+        (remaining_master_data['is_deleted'] == 'False') & 
+        (remaining_master_data['is_rejected'] == 'False')
+    ]
 
-# Save the Jira data with the required columns
-jira_upload_path = os.path.join(script_directory, 'jira_upload_data.csv')
-jira_upload_data.to_csv(jira_upload_path, index=False)
-print(f"\nJira data saved to {jira_upload_path}")
+    # Check if any data was filtered for Manually Update Wire Description
+    if filtered_data_for_src_excelsior.empty:
+        print("No records found for Manually Update Wire Description")
 
-# Exclusion: Remove rows from merged_master_data for next operation
-merged_master_data = merged_master_data[~merged_master_data.index.isin(filtered_data_for_src_excelsior.index)]
+    # Data to upload to Jira duing creation
+    jira_upload_data = pd.concat([filtered_data_for_cu_excelsior, filtered_data_for_src_excelsior])
 
-# Save the Exception Cases data with the required columns
-exceptionCases_csv_path = os.path.join(script_directory, 'exceptionCases_data.csv')
-merged_master_data.to_csv(exceptionCases_csv_path, index=False)
+    # Check if there's any data for Jira upload
+    if jira_upload_data.empty:
+        print("No data to upload to Jira.")
+    else:
+        # Save the Jira data with the required columns
+        jira_upload_path = os.path.join(script_directory, 'jira_upload_data.csv')
+        jira_upload_data.to_csv(jira_upload_path, index=False)  # Corrected: using jira_upload_path instead of merged_csv_path
+        print(f"\nJira data saved to {jira_upload_path}")
 
-################################################################################################ Processing Data for excelsior task
-# Required columns to run Generate Synthetic IBAT excelsior
-jira_link = input("Please enter the Jira link: ")
-required_columns = ['pbat', 'VBAN']
-filtered_data_for_cu_excelsior = filtered_data_for_cu_excelsior[required_columns]
-filtered_data_for_cu_excelsior.rename(columns={'pbat': 'pbat_ids', 'VBAN': 'vban_account_number'}, inplace=True)
+    # Create a new DataFrame for remaining unprocessed records
+    final_unprocessed_data = remaining_master_data[~remaining_master_data.index.isin(filtered_data_for_src_excelsior.index)]
 
-# Add new columns with specified default values
-filtered_data_for_cu_excelsior['storytime'] = jira_link if jira_link else None
-filtered_data_for_cu_excelsior['prepend_wire_reference'] = 'TRUE'
-filtered_data_for_cu_excelsior['always_override_vban_account_number'] = 'FALSE'
-filtered_data_for_cu_excelsior['partner'] = 'wellsfargo'
+    # Save the Exception Cases data with the required columns
+    exceptionCases_csv_path = os.path.join(script_directory, 'exceptionCases_data.csv')
+    final_unprocessed_data.to_csv(exceptionCases_csv_path, index=False)
+    print(f"\nException cases saved to {exceptionCases_csv_path}")
 
-# Reorder columns to match the desired output order
-output_order = ['pbat_ids', 'storytime', 'prepend_wire_reference', 'vban_account_number', 
-                'always_override_vban_account_number', 'partner']
-filtered_data_for_cu_excelsior = filtered_data_for_cu_excelsior[output_order]
+    ################################################################################################ Processing Data for excelsior task
+    # Process Generate Synthetic IBAT data only if we have records
+    if not filtered_data_for_cu_excelsior.empty:
+        # Required columns to run Generate Synthetic IBAT excelsior
+        jira_link = input("Please enter the Jira link: ")
+        required_columns = ['pbat', 'VBAN']
+        filtered_data_for_cu_excelsior = filtered_data_for_cu_excelsior[required_columns]
+        filtered_data_for_cu_excelsior.rename(columns={'pbat': 'pbat_ids', 'VBAN': 'vban_account_number'}, inplace=True)
 
-# Save the merged data with the required columns
-generateSynthticIBAT_csv_path = os.path.join(script_directory, 'generateSynthticIBAT_data.csv')
-# merged_data[required_columns].to_csv(merged_csv_path, index=False)
-filtered_data_for_cu_excelsior.to_csv(generateSynthticIBAT_csv_path, index=False)
+        # Add new columns with specified default values
+        filtered_data_for_cu_excelsior['storytime'] = jira_link if jira_link else None
+        filtered_data_for_cu_excelsior['prepend_wire_reference'] = 'TRUE'
+        filtered_data_for_cu_excelsior['always_override_vban_account_number'] = 'FALSE'
+        filtered_data_for_cu_excelsior['partner'] = 'wellsfargo'
 
-# Required columns
-required_columns = ['pbat','ibat', 'cu_src_object']
-filtered_data_for_src_excelsior = filtered_data_for_src_excelsior[required_columns]
-filtered_data_for_src_excelsior.rename(columns={'cu_src_object': 'source'}, inplace=True)
+        # Reorder columns to match the desired output order
+        output_order = ['pbat_ids', 'storytime', 'prepend_wire_reference', 'vban_account_number', 
+                        'always_override_vban_account_number', 'partner']
+        filtered_data_for_cu_excelsior = filtered_data_for_cu_excelsior[output_order]
 
-# Add new columns with specified default values
-filtered_data_for_src_excelsior['prepend_wire_reference'] = 'FALSE'
-filtered_data_for_src_excelsior['append_bnf'] = 'TRUE'
+        # Save the merged data with the required columns
+        generateSynthticIBAT_csv_path = os.path.join(script_directory, 'generateSynthticIBAT_data.csv')
+        filtered_data_for_cu_excelsior.to_csv(generateSynthticIBAT_csv_path, index=False)
+        print(f"\nGenerate Synthetic IBAT data saved to {generateSynthticIBAT_csv_path}")
+    
+    # Process Manually Update Wire Description data only if we have records
+    if not filtered_data_for_src_excelsior.empty:
+        # Required columns
+        required_columns = ['pbat','ibat', 'cu_src_object']
+        filtered_data_for_src_excelsior = filtered_data_for_src_excelsior[required_columns]
+        filtered_data_for_src_excelsior.rename(columns={'cu_src_object': 'source'}, inplace=True)
 
-# Reorder columns to match the desired output order
-output_order = ['pbat', 'ibat', 'source', 'prepend_wire_reference', 
-                'append_bnf']
-filtered_data_for_src_excelsior = filtered_data_for_src_excelsior[output_order]
+        # Add new columns with specified default values
+        filtered_data_for_src_excelsior['prepend_wire_reference'] = 'FALSE'
+        filtered_data_for_src_excelsior['append_bnf'] = 'TRUE'
 
-# Save the merged data with the required columns
-manuallyUpdateWireDescription_csv_path = os.path.join(script_directory, 'manuallyUpdateWireDescription_data.csv')
-filtered_data_for_src_excelsior.to_csv(manuallyUpdateWireDescription_csv_path, index=False)
+        # Reorder columns to match the desired output order
+        output_order = ['pbat', 'ibat', 'source', 'prepend_wire_reference', 
+                        'append_bnf']
+        filtered_data_for_src_excelsior = filtered_data_for_src_excelsior[output_order]
+
+        # Save the merged data with the required columns
+        manuallyUpdateWireDescription_csv_path = os.path.join(script_directory, 'manuallyUpdateWireDescription_data.csv')
+        filtered_data_for_src_excelsior.to_csv(manuallyUpdateWireDescription_csv_path, index=False)
+        print(f"\nManually Update Wire Description data saved to {manuallyUpdateWireDescription_csv_path}")
+    
+    print("\nScript completed successfully!")
+
+except Exception as e:
+    print(f"An error occurred during data processing: {e}")
+    print("Please check your queries and data sources.")
